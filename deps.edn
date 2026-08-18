@@ -1,12 +1,17 @@
-{:paths ["src/clojure"
-         "target/classes"] ;; for dbaos.DirectByteArrayOutputStream
- :deps {org.clojure/clojure {:mvn/version "1.10.1"}}
- :aliases {:test {:main-opts ["-m" "cognitect.test-runner"]
-                  :extra-paths ["test"]
-                  :extra-deps {com.cognitect/test-runner {:git/url "https://github.com/cognitect-labs/test-runner.git"
-                                                          :sha "5f2b5c2efb444df76fb5252102b33f542ebf7f58"}
-                               org.clojure/java.jdbc {:mvn/version "0.6.1"}
-                               org.postgresql/postgresql {:mvn/version "9.4.1208.jre7"}
-                               org.xerial/sqlite-jdbc {:mvn/version "3.36.0.3"}
-                               com.taoensso/nippy {:mvn/version "2.13.0"}
-                               amazonica/amazonica {:mvn/version "0.3.58"}}}}}
+{:paths ["src"]
+
+ ;; A durable atom for jolt: implements glimmer's IReactiveCell protocol and
+ ;; persists every mutation through a pluggable backend (file, or sqlite/postgres
+ ;; via jolt-lang/db). db's :jolt/native (sqlite3, optional libpq) is loaded by
+ ;; jolt automatically from the git dep.
+ :deps {io.github.jolt-lang/glimmer
+        {:git/url "https://github.com/jolt-lang/glimmer.git"
+         :git/sha "55e38f0b21b8decbcf156f56d3c9dd25a875148b"}
+        io.github.jolt-lang/db
+        {:git/url "https://github.com/jolt-lang/db.git"
+         :git/sha "bbebf1cccbc32a6854b20f9f1e1fbb4cc5814b06"}}
+
+ :aliases {:test {:extra-paths ["test"]
+                  :main-opts ["-m" "duratom.test-runner"]}}
+
+ :tasks {test "jolt -M:test"}}

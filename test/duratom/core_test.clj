@@ -1,455 +1,84 @@
 (ns duratom.core-test
-  (:require [clojure.test :refer :all]
-            [duratom.core :refer :all]
-            [duratom.utils :as ut]
-            [taoensso.nippy :as nippy]
-            [clojure.java
-             [shell :as shell]
-             [io :as io]]
-            [clojure.string :as str])
-  (:import (clojure.lang Agent)
-           (java.io StringWriter)))
-;====================================
-;; start the `default` VM:
-;$ docker-machine start default
+  (:require [clojure.test :refer [deftest is testing]]
+            [duratom.core :as d]
+            [duratom.backends :as b]
+            [glimmer.ratom :as ratom]
+            [jolt.fs :as fs]))
 
-;; switch to `default` when using any docker commands
-;$ eval $(docker-machine env default)
+(defn- uniq [label]
+  (str "/tmp/" label "-" (System/currentTimeMillis) "-" (rand-int 1000000)))
 
-;; start up the specified containers
-;$ docker-compose up -d
+;; A custom backend written against the protocol, to prove the extension seam.
+(defrecord MemBackend [store]
+  b/StorageBackend
+  (load-state [_] @store)
+  (persist! [_ v] (reset! store v))
+  (clear! [_] (reset! store nil) nil)
+  (close-backend [_] nil))
 
-;; run tests
-; lein test OR selectively in repl
+(deftest backend-protocol-is-the-extension-seam
+  (let [store (clojure.core/atom nil)
+        a (d/make-duratom (->MemBackend store) {:m 0})]
+    (is (= {:m 0} @a))
+    (swap! a assoc :m 1)
+    (is (= {:m 1} @store))
+    (is (= {:m 1} (d/backend-snapshot a)))))
 
-;; shutdown the containers
-;$ docker-compose down
-;====================================
+(deftest file-backend-persists-and-round-trips
+  (let [path (str (uniq "duratom-file") ".edn")
+        a (d/file-atom path {:x 1 :y 2})]
+    (try
+      (testing "initial value is persisted"
+        (is (= {:x 1 :y 2} @a))
+        (is (= {:x 1 :y 2} (d/backend-snapshot a))))
+      (testing "reset! persists"
+        (reset! a {:z 3})
+        (is (= {:z 3} @a))
+        (is (= {:z 3} (d/backend-snapshot a))))
+      (testing "swap! persists"
+        (swap! a assoc :w 4)
+        (is (= {:z 3 :w 4} @a))
+        (is (= {:z 3 :w 4} (d/backend-snapshot a))))
+      (testing "a new duratom over the same path reads persisted state"
+        (let [a2 (d/file-atom path)]
+          (is (= {:z 3 :w 4} @a2))
+          (d/destroy a2)))
+      (finally
+        (d/destroy a)
+        (when (fs/exists? path) (fs/delete path))))))
 
-(defonce docker-default-machine-ip
-  ;; `localhost` which works on Ubuntu simply won't work on MacOS.
-  ;; we need the public IP of the docker-machine - `default` in this case.
-  ;; this tends to be 192.168.99.100, but we can easily check via `docker-machine ip default`
-  (delay
-    (or (try
-          (some-> (shell/sh "docker-machine" "ip" "default")
-                  :out
-                  str/trim-newline
-                  not-empty)
-          (catch Throwable _))
-        ;; perhaps docker-machine is not involved
-        "localhost")))
+(deftest sql-backend-persists-and-round-trips
+  (let [db-path (str (uniq "duratom-sql") ".db")
+        spec (str "sqlite:" db-path)
+        a (d/sql-atom spec "duratom_state" {:n 1})]
+    (try
+      (testing "initial value is persisted"
+        (is (= {:n 1} @a))
+        (is (= {:n 1} (d/backend-snapshot a))))
+      (testing "reset! persists"
+        (reset! a {:n 2})
+        (is (= {:n 2} @a))
+        (is (= {:n 2} (d/backend-snapshot a))))
+      (testing "swap! persists"
+        (swap! a update :n inc)
+        (is (= {:n 3} @a))
+        (is (= {:n 3} (d/backend-snapshot a))))
+      (testing "a new duratom over the same table reads persisted state"
+        (let [a2 (d/sql-atom spec "duratom_state")]
+          (is (= {:n 3} @a2))
+          (d/destroy a2)))
+      (finally
+        (d/destroy a)
+        (when (fs/exists? db-path) (fs/delete db-path))))))
 
-(defn- common*
-  [dura exists? async?]
-  (let [sleep-time 200
-        [f atom?] (if (instance? Agent dura)
-                    [send-off false]
-                    [swap! true])]
-    (-> dura ;; init = {:x 1 :y 2}
-        (doto (f assoc :z 3))
-        (doto (f dissoc :x)))
-
-    (when async?
-      (Thread/sleep sleep-time))
-
-    (is (= {:z 3 :y 2} @dura))
-    (is (= (backend-snapshot dura) @dura))
-
-    (-> dura
-        (doto (f  (constantly [1 2 3])))
-        (doto (f  (comp vec rest))))
-
-    (when async?
-      (Thread/sleep sleep-time))
-
-    (is (= [2 3] @dura))
-    (is (= (backend-snapshot dura) @dura))
-
-    (when async?
-      (Thread/sleep sleep-time))
-
-    (if atom?
-      (is (= [[2 3] [1 2 3]]
-             (reset-vals! dura [1 2 3])))
-      ;; don't break the assertions below
-      (f dura (constantly [1 2 3])))
-
-    (when async?
-      (Thread/sleep sleep-time))
-
-    (if atom?
-      (is (= [[1 2 3] [2 3]]
-            (swap-vals! dura rest)))
-      (f dura rest))
-
-    (f dura (partial into (sorted-set)))
-
-    (when async?
-      (Thread/sleep sleep-time))
-
-    (is (sorted? @dura))
-    (is (= (sorted-set 2 3) (backend-snapshot dura) @dura))
-
-    (f dura #(with-meta % {:a 1 :b 2}))
-
-    (when async?
-      (Thread/sleep sleep-time))
-
-    (is (= (sorted-set 2 3) (backend-snapshot dura) @dura))
-    (is (= {:a 1 :b 2} (meta (backend-snapshot dura)) (meta @dura)))
-
-    (when async?
-      (Thread/sleep sleep-time))
-
-    (destroy dura)
-
-    (when async?
-      (Thread/sleep sleep-time))
-
-    (is (sorted? @dura))
-    (is (= #{2 3} @dura))
-    (if atom?
-      ;; this exception can only be seen/reacted to
-      ;; inside the agent's error-handler
-      (is (thrown? IllegalStateException (f dura conj 4)))
-      (f dura conj 4)) ;; will trigger validator error
-    (is (false? (exists?)) "Storage resource was NOT cleaned-up!!!")
-    )
-  )
-
-(defn- file-backed-tests*
-  [async?]
-  (let [rel-path "data_temp.txt"
-        _ (when (.exists (io/file rel-path))
-            (io/delete-file rel-path)) ;; proper cleanup before testing
-        init {:x 1 :y 2}
-        dura (add-watch
-               (duratom :local-file
-                        :file-path rel-path
-                        :init init
-                        :rw (cond-> default-file-rw
-                                    (not async?) (assoc :commit-mode :sync)))
-               :log (fn [k r old-state new-state]
-                      (println "Transitioning from" (ut/pr-str-fully true old-state)
-                               "to" (ut/pr-str-fully true new-state) "...")))]
-
-    ;; empty file first
-    (common* dura #(.exists (io/file rel-path)) async?)
-    ;; with-contents thereafter
-    (spit rel-path (pr-str init))
-    (common* (add-watch
-               (duratom :local-file
-                        :file-path rel-path
-                        :init init
-                        :rw (cond-> default-file-rw
-                                    (not async?) (assoc :commit-mode :sync)))
-               :log (fn [k r old-state new-state]
-                      (println "Transitioning from" (ut/pr-str-fully true old-state)
-                               "to" (ut/pr-str-fully true new-state) "...")))
-             #(.exists (io/file rel-path))
-             async?)
-
-    ;; duragent version
-    (when async?
-      (let [p (promise)]
-        (common* (duragent :local-file
-                           :file-path rel-path
-                           :init init
-                           :rw (assoc default-file-rw
-                                 :error-handler
-                                 (fn [_ e] (deliver p e))))
-                 #(.exists (io/file rel-path))
-                 async?)
-        (is (= "duratom/duragent has been released!"
-               (.getMessage @p)))))
-    )
-  )
-
-
-(deftest file-backed-tests
-  (println "File-backed atom/agent with async commit...")
-  (file-backed-tests* true)
-  (println "File-backed atom with sync commit...")
-  (file-backed-tests* false)
-  )
-
-(defn- postgres-backed-tests*
-  [async?]
-  (let [ip @docker-default-machine-ip
-        db-spec {:classname   "org.postgresql.Driver"
-                 :subprotocol "postgresql"
-                 :subname     (str "//"  ip ":5432/atomDB") ;; localhost won't work on the mac
-                 :user        "dimitris"
-                 :password    "secret"}
-        table-name "atom_state"
-        _ (ut/delete-relevant-row! db-spec table-name 0)
-        init {:x 1 :y 2}
-        dura (add-watch
-               (duratom :postgres-db
-                        :db-config db-spec
-                        :table-name table-name
-                        :row-id 0
-                        :init init
-                        :rw (cond-> default-postgres-rw
-                                    (not async?) (assoc :commit-mode :sync)))
-               :log (fn [k, r, old-state, new-state]
-                      (println "Transitioning from" (ut/pr-str-fully true old-state)
-                               "to" (ut/pr-str-fully true new-state) "...")))]
-
-    ;; empty row first
-    (common* dura
-             #(some? (ut/get-pgsql-value db-spec table-name 0 ut/read-edn-string))
-             async?)
-    ;; with-contents thereafter
-    (ut/update-or-insert! db-spec table-name {:id 0 :value (pr-str init)} ["id = ?" 0])
-    (common* (add-watch
-               (duratom :postgres-db
-                        :db-config db-spec
-                        :table-name table-name
-                        :row-id 0
-                        :init init
-                        :rw (cond-> default-postgres-rw
-                                    (not async?) (assoc :commit-mode :sync)))
-               :log (fn [k, r, old-state, new-state]
-                      (println "Transitioning from" (ut/pr-str-fully true old-state)
-                               "to" (ut/pr-str-fully true new-state) "...")))
-             #(some? (ut/get-pgsql-value db-spec table-name 0 ut/read-edn-string))
-             async?)
-
-    ;; duragent version
-    (when async?
-      (common* (duragent :postgres-db
-                         :db-config db-spec
-                         :table-name table-name
-                         :row-id 0
-                         :init init)
-               #(some? (ut/get-pgsql-value db-spec table-name 0 ut/read-edn-string))
-               async?))
-    )
-  )
-
-
-(deftest postgres-backed-tests
-  (println "PGSQL-backed atom/agent with async commit...")
-  (postgres-backed-tests* true)
-  (println "PGSQL-backed atom with sync commit...")
-  (postgres-backed-tests* false)
-  )
-
-(defn- redis-backed-tests*
-  [async?]
-  (let [ip @docker-default-machine-ip
-        db-config  {:pool {}
-                    :spec {:uri (str "redis://" ip ":6379/")}} ;; localhost won't work on the mac
-        key-name "atom:state"
-        init {:x 1 :y 2}
-        key-exists? #(ut/redis-key-exists? db-config key-name)
-        _ (ut/redis-del db-config key-name)
-        dura (duratom :redis-db
-                      :db-config db-config
-                      :key-name key-name
-                      :init init
-                      :rw (cond-> default-redis-rw
-                            (not async?) (assoc :commit-mode :sync)))]
-    ;; empty key first
-    (common* dura key-exists? async?)
-    ;; with contents
-    (ut/redis-set db-config key-name (pr-str init))
-    (common* (duratom :redis-db
-                      :db-config db-config
-                      :key-name key-name
-                      :init init
-                      :rw (cond-> default-redis-rw
-                            (not async?) (assoc :commit-mode :sync)))
-             key-exists?
-             async?)
-
-    ;; duragent version
-    (when async?
-      (common* (duragent :redis-db
-                         :db-config db-config
-                         :key-name key-name
-                         :init init)
-               key-exists?
-               async?))
-
-    ))
-
-(deftest redis-backed-tests
-  (println "Redis-backed atom with async commit...")
-  (redis-backed-tests* true)
-  (println "Redis-backed atom with sync commit...")
-  (redis-backed-tests* false)
-  )
-
-(defn- sqlite-backed-tests*
-  [async?]
-  (let [filename "sqlite-test.sqlite"
-        _ (when (.exists (io/file filename))
-            (io/delete-file filename)) ;; proper cleanup before testing
-        db-spec {:classname   "org.sqlite.JDBC"
-                 :subprotocol "sqlite"
-                 :subname     "sqlite-test.sqlite"
-                 :user        "dimitris"
-                 :password    "secret"}
-        table-name "atom_state"
-        _ (ut/delete-relevant-row! db-spec table-name 0)
-        init {:x 1 :y 2}
-        dura (add-watch
-              (duratom :sqlite-db
-                       :db-config db-spec
-                       :table-name table-name
-                       :row-id 0
-                       :init init
-                       :rw (cond-> default-sqlite-rw
-                             (not async?) (assoc :commit-mode :sync)))
-              :log (fn [k, r, old-state, new-state]
-                     (println "Transitioning from" (ut/pr-str-fully true old-state)
-                              "to" (ut/pr-str-fully true new-state) "...")))]
-
-    ;; empty row first
-    (common* dura
-             #(some? (ut/get-sqlite-value db-spec table-name 0 ut/read-edn-string))
-             async?)
-    ;; with-contents thereafter
-    (ut/update-or-insert! db-spec table-name {:id 0 :value (pr-str init)} ["id = ?" 0])
-    (common* (add-watch
-              (duratom :sqlite-db
-                       :db-config db-spec
-                       :table-name table-name
-                       :row-id 0
-                       :init init
-                       :rw (cond-> default-postgres-rw
-                             (not async?) (assoc :commit-mode :sync)))
-              :log (fn [k, r, old-state, new-state]
-                     (println "Transitioning from" (ut/pr-str-fully true old-state)
-                              "to" (ut/pr-str-fully true new-state) "...")))
-             #(some? (ut/get-sqlite-value db-spec table-name 0 ut/read-edn-string))
-             async?)
-
-    ;; duragent version
-    (when async?
-      (common* (duragent :sqlite-db
-                         :db-config db-spec
-                         :table-name table-name
-                         :row-id 0
-                         :init init)
-               #(some? (ut/get-sqlite-value db-spec table-name 0 ut/read-edn-string))
-               async?))
-    ;; manually delete sqlite file to clean up
-    (io/delete-file filename)))
-
-(deftest sqlite-backed-tests
-  (println "SQLite-backed atom/agent with async commit...")
-  (sqlite-backed-tests* true)
-  (println "SQLite-backed atom with sync commit...")
-  (sqlite-backed-tests* false)
-  )
-
-(deftest custom-rw-tests
-
-  (testing "File-backed atom containing `nippy` bytes..."
-    (let [rel-path "data_temp.txt"
-          _ (when (.exists (io/file rel-path))
-              (io/delete-file rel-path)) ;; proper cleanup before testing
-          init {:x 1 :y 2}
-          dura (add-watch
-                 (duratom :local-file
-                          :file-path rel-path
-                          :init init
-                          :rw {:read  nippy/thaw-from-file
-                               :write nippy/freeze-to-file})
-                 :log (fn [k r old-state new-state]
-                        (println "Transitioning from" old-state "to" new-state "...")))]
-
-      ;; empty file first
-      (common* dura #(.exists (io/file rel-path)) true)
-      ;; with-contents thereafter
-      (nippy/freeze-to-file rel-path init)
-      (common* (add-watch
-                 (duratom :local-file
-                          :file-path rel-path
-                          :rw {:read  nippy/thaw-from-file
-                               :write nippy/freeze-to-file})
-                 :log (fn [k r old-state new-state]
-                        (println "Transitioning from" old-state "to" new-state "...")))
-               #(.exists (io/file rel-path))
-               true)
-      )
-    )
-
-  (testing "PostgresDB-backed atom containing `nippy` bytes..."
-    (let [ip @docker-default-machine-ip
-          db-spec {:classname   "org.postgresql.Driver"
-                   :subprotocol "postgresql"
-                   :subname     (str "//"  ip ":5432/atomDB")
-                   :user        "dimitris"
-                   :password    "secret"}
-          table-name "atom_state_bytes"
-          init {:x 1 :y 2}
-          dura (add-watch
-                 (duratom :postgres-db
-                          :db-config db-spec
-                          :table-name table-name
-                          :row-id 0
-                          :init init
-                          :rw {:read  nippy/thaw
-                               :write nippy/freeze
-                               :column-type :bytea})
-                 :log (fn [k, r, old-state, new-state]
-                        (println "Transitioning from" old-state "to" new-state "...")))]
-
-      ;; empty row first
-      (common* dura
-               #(some? (ut/get-pgsql-value db-spec table-name 0 nippy/thaw))
-               true)
-      ;; with-contents thereafter
-      (ut/update-or-insert! db-spec table-name {:id 0 :value (nippy/freeze init)} ["id = ?" 0])
-      (common* (add-watch
-                 (duratom :postgres-db
-                          :db-config db-spec
-                          :table-name table-name
-                          :row-id 0
-                          :rw {:read  nippy/thaw
-                               :write nippy/freeze
-                               :column-type :bytea})
-                 :log (fn [k, r, old-state, new-state]
-                        (println "Transitioning from" old-state "to" new-state "...")))
-               #(some? (ut/get-pgsql-value db-spec table-name 0 nippy/thaw))
-               true)
-      )
-    )
-
-  (testing "Redis DB-backed atom containing `nippy` bytes..."
-    (let [ip @docker-default-machine-ip
-          db-config  {:pool {}
-                      :spec {:uri (str "redis://" ip ":6379/")}}
-          key-name "atom:state:bytes"
-          key-exists? #(ut/redis-key-exists? db-config key-name)
-          init {:x 1 :y 2}
-          dura (duratom :redis-db
-                        :db-config db-config
-                        :key-name key-name
-                        :init init
-                        :rw {:read  identity
-                             :write identity})]
-
-      ;; empty row first
-      (common* dura
-               key-exists?
-               true)
-      ;; with-contents thereafter
-      (ut/redis-set db-config key-name init)
-      (common* (duratom :redis-db
-                        :db-config db-config
-                        :key-name key-name
-                        :init init
-                        :rw {:read  identity
-                             :write identity})
-               key-exists?
-               true)
-      )
-    )
-)
-
+(deftest duratom-is-a-glimmer-reactive-cell
+  (let [path (str (uniq "duratom-react") ".edn")
+        a (d/file-atom path 2)
+        sq (ratom/reaction (* @a @a))]
+    (try
+      (is (= 4 @sq))
+      (reset! a 5)
+      (is (= 25 @sq))
+      (finally
+        (d/destroy a)
+        (when (fs/exists? path) (fs/delete path))))))
